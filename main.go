@@ -1,22 +1,24 @@
 package main
 
 import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"os"
 	"sort"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/cognitoidentityprovider"
-	"github.com/urfave/cli"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider"
+	"github.com/aws/aws-sdk-go-v2/service/cognitoidentityprovider/types"
+	"github.com/urfave/cli/v2"
 )
 
 var (
 	appName, appVer string
-	ses             *session.Session
-	sessionParams   session.Options
-	cip             *cognitoidentityprovider.CognitoIdentityProvider
 )
 
 func main() {
@@ -26,81 +28,36 @@ func main() {
 	app.Usage = "Used for quick testing auth on Cognito Auth Pool"
 	app.Version = appVer
 	app.Copyright = ""
-	app.Authors = []cli.Author{
-		{
-			Name: "Rafpe ( https://rafpe.ninja )",
-		},
-	}
 
 	app.Flags = []cli.Flag{
-		cli.StringFlag{
-			Name:   "profile,p",
-			Value:  "-",
-			EnvVar: "AWS_PROFILE",
-		},
-		cli.StringFlag{
-			Name:   "region",
-			Value:  "",
-			EnvVar: "AWS_DEFAULT_REGION",
-		},
-		cli.StringFlag{
-			Name:   "access-key",
-			EnvVar: "AWS_ACCESS_KEY_ID",
-		},
-		cli.StringFlag{
-			Name:   "secret-key",
-			EnvVar: "AWS_SECRET_ACCESS_KEY",
+		&cli.StringFlag{
+			Name:    "profile,p",
+			Value:   "default",
+			Usage:   "aws profile",
+			EnvVars: []string{"AWS_PROFILE"},
 		},
 	}
 
-	app.Before = func(c *cli.Context) error {
-		var sesErr error
-
-		switch c.String("profile") {
-		case "-", "":
-			ses, sesErr = session.NewSession(&aws.Config{
-				Region:      aws.String(c.String("region")),
-				Credentials: credentials.NewStaticCredentials(c.String("access-key"), c.String("secret-key"), ""),
-			})
-			if sesErr != nil {
-				fmt.Println(sesErr)
-				os.Exit(1)
-			}
-		default:
-			sessionParams = session.Options{
-				Profile: c.String("profile"),
-				Config:  aws.Config{Region: aws.String(c.String("region"))},
-			}
-
-			ses, sesErr = session.NewSessionWithOptions(sessionParams)
-			if sesErr != nil {
-				fmt.Println(sesErr)
-				os.Exit(1)
-			}
-		}
-
-		cip = cognitoidentityprovider.New(ses)
-
-		return nil
-	}
-
-	app.Commands = []cli.Command{
+	app.Commands = []*cli.Command{
 		{
 			Name:  "auth",
 			Usage: "Authenticates user",
 			Flags: []cli.Flag{
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  "username",
 					Usage: "username used in Cognito User Pool",
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  "password",
 					Usage: "Password for the username",
 				},
-				cli.StringFlag{
+				&cli.StringFlag{
 					Name:  "clientID",
-					Value: "-",
 					Usage: "App clientID from Cognito User Pool",
+				},
+				&cli.StringFlag{
+					Name:  "hash",
+					Usage: "secret hash of the client",
 				},
 			},
 			Action: cmdAuthenticateUser,
@@ -108,33 +65,37 @@ func main() {
 		{
 			Name:  "admin",
 			Usage: "Admin actions",
-			Subcommands: []cli.Command{
+			Subcommands: []*cli.Command{
 				{
 					Name:  "reset-pass",
 					Usage: "Administratively resets password",
 					Flags: []cli.Flag{
-						cli.StringFlag{
+						&cli.StringFlag{
 							Name:  "username",
 							Usage: "username used in Cognito User Pool",
 						},
-						cli.StringFlag{
+						&cli.StringFlag{
 							Name:  "pass-new",
 							Usage: "New password for the username",
 						},
-						cli.StringFlag{
+						&cli.StringFlag{
 							Name:  "clientID",
 							Value: "IP",
 							Usage: "App clientID from Cognito User Pool",
 						},
-						cli.StringFlag{
+						&cli.StringFlag{
 							Name:  "userPoolID",
 							Value: "IP",
 							Usage: "Cognito User Pool id",
 						},
-						cli.StringFlag{
+						&cli.StringFlag{
 							Name:  "session",
 							Value: "IP",
 							Usage: "Session param from auth action",
+						},
+						&cli.StringFlag{
+							Name:  "hash",
+							Usage: "Client Application secret",
 						},
 					},
 					Action: cmdAdminResetPassword,
@@ -145,11 +106,6 @@ func main() {
 
 	sort.Sort(cli.FlagsByName(app.Flags))
 	sort.Sort(cli.CommandsByName(app.Commands))
-
-	app.Action = func(c *cli.Context) error {
-
-		return nil
-	}
 
 	err := app.Run(os.Args)
 	if err != nil {
@@ -164,73 +120,93 @@ func cmdAdminResetPassword(c *cli.Context) error {
 	userPoolID := c.String("userPoolID")
 	session := c.String("session")
 
+	fmt.Println(c.String("profile"))
+	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithSharedConfigProfile(c.String("profile")))
+	if err != nil {
+		return err
+	}
+
+	cip := cognitoidentityprovider.NewFromConfig(cfg)
+	mac := hmac.New(sha256.New, []byte(c.String("hash")))
+	mac.Write([]byte(c.String("username") + c.String("clientID")))
+
+	secretHash := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+
 	params := &cognitoidentityprovider.AdminRespondToAuthChallengeInput{
-		ChallengeName: aws.String("NEW_PASSWORD_REQUIRED"),
-		ChallengeResponses: map[string]*string{
-			"NEW_PASSWORD": aws.String(passNew),
-			"USERNAME":     aws.String(username),
+		ChallengeName: types.ChallengeNameTypeNewPasswordRequired,
+		ChallengeResponses: map[string]string{
+			"NEW_PASSWORD": passNew,
+			"USERNAME":     username,
+			"SECRET_HASH":  secretHash,
 		},
 		ClientId:   aws.String(clientID),
 		UserPoolId: aws.String(userPoolID),
 		Session:    aws.String(session),
 	}
 
-	adminChallengeResp, adminChallengeErr := cip.AdminRespondToAuthChallenge(params)
+	adminChallengeResp, adminChallengeErr := cip.AdminRespondToAuthChallenge(context.Background(), params)
 	if adminChallengeErr != nil {
 		return adminChallengeErr
 	}
-	fmt.Println(adminChallengeResp)
 
+	jsonAuthResponse, _ := json.MarshalIndent(adminChallengeResp, "", "    ")
+	fmt.Println(string(jsonAuthResponse))
 	return nil
 }
 
-func cmdChangePassword(c *cli.Context) error {
-
-	accessToken := c.String("token")
-	passOld := c.String("pass-old")
-	passNew := c.String("pass-new")
-
-	params := &cognitoidentityprovider.ChangePasswordInput{
-		AccessToken:      aws.String(accessToken),
-		PreviousPassword: aws.String(passOld),
-		ProposedPassword: aws.String(passNew),
-	}
-
-	newPassResponse, newPassErr := cip.ChangePassword(params)
-
-	if newPassErr != nil {
-		return newPassErr
-	}
-
-	fmt.Println(newPassResponse)
-
-	return nil
-}
+//func cmdChangePassword(c *cli.Context) error {
+//
+//	accessToken := c.String("token")
+//	passOld := c.String("pass-old")
+//	passNew := c.String("pass-new")
+//
+//	params := &cognitoidentityprovider.ChangePasswordInput{
+//		AccessToken:      aws.String(accessToken),
+//		PreviousPassword: aws.String(passOld),
+//		ProposedPassword: aws.String(passNew),
+//	}
+//
+//	newPassResponse, newPassErr := cip.ChangePassword(params)
+//
+//	if newPassErr != nil {
+//		return newPassErr
+//	}
+//
+//	fmt.Println(newPassResponse)
+//
+//	return nil
+//}
 
 // cmdAuthenticateUser invokes auth method with given params
 // to get auth tokens.
 //
 func cmdAuthenticateUser(c *cli.Context) error {
+	cfg, err := config.LoadDefaultConfig(context.Background())
+	if err != nil {
+		return err
+	}
+	cip := cognitoidentityprovider.NewFromConfig(cfg)
+	mac := hmac.New(sha256.New, []byte(c.String("hash")))
+	mac.Write([]byte(c.String("username") + c.String("clientID")))
 
-	username := aws.String(c.String("username"))
-	password := aws.String(c.String("password"))
-	clientID := aws.String(c.String("clientID"))
+	secretHash := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 
 	params := &cognitoidentityprovider.InitiateAuthInput{
-		AuthFlow: aws.String("USER_PASSWORD_AUTH"),
-		AuthParameters: map[string]*string{
-			"USERNAME": username,
-			"PASSWORD": password,
+		AuthFlow: types.AuthFlowTypeUserPasswordAuth,
+		AuthParameters: map[string]string{
+			"USERNAME":    c.String("username"),
+			"PASSWORD":    c.String("password"),
+			"SECRET_HASH": secretHash,
 		},
-		ClientId: clientID,
+		ClientId: aws.String(c.String("clientID")),
 	}
 
-	authResponse, authError := cip.InitiateAuth(params)
+	authResponse, authError := cip.InitiateAuth(context.Background(), params)
 	if authError != nil {
 		return authError
 	}
 
-	fmt.Println(authResponse)
-
+	jsonAuthResponse, _ := json.MarshalIndent(authResponse, "", "    ")
+	fmt.Println(string(jsonAuthResponse))
 	return nil
 }
